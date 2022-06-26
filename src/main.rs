@@ -1,98 +1,182 @@
-// code taken from https://github.com/RustAudio/dasp/blob/master/examples/synth.rs   
+use chrono::prelude::*;
+use crossterm::{
+    event::{self, Event as CEvent, KeyCode},
+    terminal::{disable_raw_mode, enable_raw_mode},
+    execute,
 
-
-use cpal;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use dasp::{signal, Sample, Signal};
+};
+use rand::{distributions::Alphanumeric, prelude::*};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io;
 use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+use std::collections::LinkedList;
+use thiserror::Error;
+use tui::{
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Span, Spans},
+    widgets::{
+        Block, BorderType, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Dataset, Axis, Chart, GraphType
+    },
+    Terminal,
+    symbols,
+};
 
-fn main() -> Result<(), anyhow::Error> {
-    // cpal is the low-level audio recording and playback library
-    // initialize by setting the host to the default audio device
-    // detected by cpal
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .expect("failed to find a default output device");
-    let config = device.default_output_config()?;
-
-    // change args to the `run` function based on sample format of output device
-    match config.sample_format() {
-        cpal::SampleFormat::F32 => run::<f32>(&device, &config.into())?,
-        cpal::SampleFormat::I16 => run::<i16>(&device, &config.into())?,
-        cpal::SampleFormat::U16 => run::<u16>(&device, &config.into())?,
-    }
-
-    Ok(())
+enum Event<I> {
+    Input(I),
+    Tick,
 }
 
-//note that the <T> flag just defines T as a certain data type as a parameter for the functio
-
-fn run<T>(device: &cpal::Device, config: &cpal::StreamConfig) -> Result<(), anyhow::Error>
-where
-    T: cpal::Sample,
-{
-    // Create a signal chain to play back 1 second of each oscillator at A4.
-    let hz = signal::rate(config.sample_rate.0 as f64).const_hz(440.0);
-    // & defines a wave with sample rate dependent on the device (saved as float64)
-    let one_sec = config.sample_rate.0 as usize;
-    
-    // crates a sequence of events to play back
-    let mut synth = hz
-        // cloning hz (type signal::rate) this is only needed when chaining
-        // together multiple different oscillations
-        .clone().sine().take(one_sec)
-        // sine, saw, and square are different types of waves that we are
-        // creating that conform to the 440 hz signal::rate we defined
-        // take(one_sec) creates an iterator that will write signal data
-        // for the equivalent of one second
-        .chain(hz.clone().saw().take(one_sec))
-        .chain(hz.clone().square().take(one_sec))
-        .chain(hz.clone().noise_simplex().take(one_sec))
-        .chain(signal::noise(0).take(one_sec))
-        .map(|s| s.to_sample::<f32>() * 0.2);
-
-    // A channel for indicating when playback has completed.
-    let (complete_tx, complete_rx) = mpsc::sync_channel(1);
-
-    // Create and run the stream.
-    let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
-    let channels = config.channels as usize;
-    let stream = device.build_output_stream(
-        config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            write_data(data, channels, &complete_tx, &mut synth)
-        },
-        err_fn,
-    )?;
-    stream.play()?;
-
-    // Wait for playback to complete.
-    complete_rx.recv().unwrap();
-    stream.pause()?;
-
-    Ok(())
+struct Wave {
+    freq: f32,
+    module: i16, //1 - base oscillator, 2 - amplifier, 3 - filter,
+    form: i16, // 1 - sine, 2 - saw, 3 - square
 }
 
-fn write_data<T>(
-    output: &mut [T],
-    channels: usize,
-    complete_tx: &mpsc::SyncSender<()>,
-    signal: &mut dyn Iterator<Item = f32>,
-) where
-    T: cpal::Sample,
-{
-    for frame in output.chunks_mut(channels) {
-        let sample = match signal.next() {
-            None => {
-                complete_tx.try_send(()).ok();
-                0.0
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // test stuff with a linked list
+    let mut ls: LinkedList<Wave> = LinkedList::new();
+    ls.push_back(Wave { freq: 444.0, module: 1, form: 1 });
+    ls.push_back(Wave { freq: 20.0, module: 2, form: 3});
+
+    // setup terminal
+    enable_raw_mode().expect("can run in raw mode");
+
+    let (tx, rx) = mpsc::channel();
+    let tick_rate = Duration::from_millis(200);
+    // spawn thread to accept keyboard input
+    thread::spawn(move || {
+        let mut last_time = Instant::now();
+        loop{
+            let timeout=tick_rate
+                .checked_sub(last_time.elapsed())
+                .unwrap_or_else(|| Duration::from_secs(0));
+            
+            if event::poll(timeout).expect("poll works") {
+                if let CEvent::Key(key) = event::read().expect("can read events") {
+                    tx.send(Event::Input(key)).expect("can send events");
+                }
             }
-            Some(sample) => sample,
-        };
-        let value: T = cpal::Sample::from::<f32>(&sample);
-        for sample in frame.iter_mut() {
-            *sample = value;
+
+            if last_time.elapsed() >= tick_rate {
+                if let Ok(_) = tx.send(Event::Tick) {
+                    last_time = Instant::now();
+                }
+            }
+
         }
+    });
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+    
+    loop{
+        terminal.draw(|rect| {
+            let size = rect.size();
+            let vsplit = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(2)
+                .constraints(
+                    [
+                        Constraint::Length(3),
+                        Constraint::Min(2),
+                    ]
+                    .as_ref(),
+                ).split(size);
+
+            let desc=Paragraph::new("a - create new wave | e - edit wave | arrows - navigate")
+                .style(Style::default().fg(Color::LightCyan))
+                .alignment(Alignment::Left)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .style(Style::default().fg(Color::White))
+                        .title("Digital Synth")
+                        .border_type(BorderType::Plain),
+                );
+            rect.render_widget(desc, vsplit[0]);
+            let hsplit = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(
+                    [Constraint::Percentage(20), Constraint::Percentage(80)].as_ref(),
+                )
+                .split(vsplit[1]);
+            let (left, right) = draw_waves(&mut ls);
+            rect.render_widget(left, hsplit[0]);
+            rect.render_widget(right, hsplit[1]);
+        });
     }
+
+    // restore terminal
+    disable_raw_mode()?;
+    terminal.show_cursor()?;
+
+    Ok(())
+}
+
+fn draw_waves(ls: &mut LinkedList<Wave>) -> (List, Chart){
+    let mut items = ls.iter();
+    let listt:Vec<ListItem> = items
+        .map(|wave| { ListItem::new(print_wave(wave)) })
+        .collect();
+
+    let list = List::new(listt)
+        .block(Block::default().title("List").borders(Borders::ALL))
+        .style(Style::default().fg(Color::White))
+        .highlight_style(Style::default().add_modifier(Modifier::ITALIC))
+        .highlight_symbol(">>");
+
+    let dataset = make_dataset();
+    let chart = Chart::new(dataset)
+        .block(Block::default().title("Chart"))
+        .x_axis(Axis::default()
+            .title(Span::styled("X Axis", Style::default().fg(Color::Red)))
+            .style(Style::default().fg(Color::White))
+            .bounds([0.0, 10.0])
+            .labels(["0.0", "5.0", "10.0"].iter().cloned().map(Span::from).collect()))
+        .y_axis(Axis::default()
+            .title(Span::styled("Y Axis", Style::default().fg(Color::Red)))
+            .style(Style::default().fg(Color::White))
+            .bounds([0.0, 10.0])
+            .labels(["0.0", "5.0", "10.0"].iter().cloned().map(Span::from).collect())); 
+    (list, chart)
+}
+
+fn make_dataset() -> Vec<Dataset<'static>>{
+    // take in the signal and return it as a datset
+    // this is a placeholder until we get actual signals
+    let datasets = vec![
+        Dataset::default()
+            .name("data1")
+            .marker(symbols::Marker::Dot)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(Color::Cyan))
+            .data(&[(0.0, 5.0), (1.0, 6.0), (1.5, 6.434)]),
+        Dataset::default()
+            .name("data2")
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Magenta))
+            .data(&[(4.0, 5.0), (5.0, 8.0), (7.66, 13.5)]),
+    ];
+
+    datasets
+}
+
+fn print_wave(wave: &Wave) -> String {
+    format!("{module}, {freq} hz", 
+        module = match wave.module {
+            1 => "Oscillator",
+            2 => "Amplifier",
+            3 => "Filter",
+            _ => "Invalid Wave",
+        },
+        freq = wave.freq)
 }
